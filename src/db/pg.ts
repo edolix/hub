@@ -3995,32 +3995,39 @@ class PgDatabase implements Database {
     return rows.rows[0] === undefined ? undefined : toGitHubRepositoryRecord(rows.rows[0]);
   }
 
-  async upsertGitHubRepositories(
+  async replaceGitHubRepositories(
     organizationId: string,
     connectionId: string,
-    repositories: Array<
+    repositories: ReadonlyArray<
       Pick<GitHubRepositoryRecord, "repositoryId" | "fullName" | "defaultBranch">
     >,
   ): Promise<void> {
-    for (const repository of repositories) {
-      await query(
-        this.pool,
-        `insert into github_repositories
-           (organization_id, connection_id, repository_id, full_name, default_branch)
-         values ($1, $2, $3, $4, $5)
-         on conflict (connection_id, repository_id) do update
-           set full_name = excluded.full_name,
-               default_branch = excluded.default_branch,
-               updated_at = clock_timestamp()`,
-        [
-          organizationId,
-          connectionId,
-          repository.repositoryId,
-          repository.fullName,
-          repository.defaultBranch,
-        ],
+    await this.pool.transaction(async (client) => {
+      await client.query(
+        `delete from github_repositories
+         where organization_id = $1 and connection_id = $2
+           and repository_id <> all($3::bigint[])`,
+        [organizationId, connectionId, repositories.map((repository) => repository.repositoryId)],
       );
-    }
+      for (const repository of repositories) {
+        await client.query(
+          `insert into github_repositories
+             (organization_id, connection_id, repository_id, full_name, default_branch)
+           values ($1, $2, $3, $4, $5)
+           on conflict (connection_id, repository_id) do update
+             set full_name = excluded.full_name,
+                 default_branch = excluded.default_branch,
+                 updated_at = clock_timestamp()`,
+          [
+            organizationId,
+            connectionId,
+            repository.repositoryId,
+            repository.fullName,
+            repository.defaultBranch,
+          ],
+        );
+      }
+    });
   }
 
   async findGitHubConfigurationTarget(

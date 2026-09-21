@@ -208,7 +208,7 @@ export class ProjectDashboard {
       const available = await this.github.listInstallationRepositories({
         installationId: connection.installationId,
       });
-      await this.database.upsertGitHubRepositories(
+      await this.database.replaceGitHubRepositories(
         tenant.organization.id,
         connection.id,
         available,

@@ -1531,10 +1531,14 @@ export interface Database {
     organizationId: string,
     fullName: string,
   ): Promise<GitHubRepositoryRecord | undefined>;
-  upsertGitHubRepositories(
+  /**
+   * Makes `repositories` the connection's complete catalogue: listed repositories are inserted or
+   * refreshed, and rows the installation no longer grants are removed.
+   */
+  replaceGitHubRepositories(
     organizationId: string,
     connectionId: string,
-    repositories: Array<
+    repositories: ReadonlyArray<
       Pick<GitHubRepositoryRecord, "repositoryId" | "fullName" | "defaultBranch">
     >,
   ): Promise<void>;

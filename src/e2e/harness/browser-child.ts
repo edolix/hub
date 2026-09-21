@@ -652,7 +652,7 @@ async function acceptInstallProviderDispatchFixture(
     if (github === undefined || github.organizationId !== message.organizationId) {
       throw new Error("GitHub connection unavailable");
     }
-    await database.upsertGitHubRepositories(message.organizationId, github.id, [
+    await database.replaceGitHubRepositories(message.organizationId, github.id, [
       {
         repositoryId: message.repositoryId,
         fullName: message.repository,

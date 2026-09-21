@@ -12,7 +12,11 @@ import {
   enrollTestDaemon,
   TEST_DAEMON_SLUG,
 } from "../../test-utils/project-configuration.js";
-import type { ProjectRecord, StartConnectionAttemptInput } from "../../db/types.js";
+import type {
+  ConnectionAttemptRecord,
+  ProjectRecord,
+  StartConnectionAttemptInput,
+} from "../../db/types.js";
 import type { GitHubConnectionClient } from "./client.js";
 import { createGitHubRegistration } from "./index.js";
 import type { GitHubConfigurationProvider } from "../../configuration/github-sync.js";
@@ -567,14 +571,218 @@ describe("GitHub registration", () => {
     assert.equal(response.status, 200);
     assert.deepEqual(order, ["claim:lifecycle-1", "verify", "apply:present"]);
   });
+
+  it("records the installation's repositories when the connection is bound", async () => {
+    const database = createMemoryDatabase();
+    database.readConnectionAttempt = () => Promise.resolve(authorizationAttempt());
+    const bound: number[] = [];
+    database.bindGitHubConnection = (input) => {
+      bound.push(input.installationId);
+      return Promise.resolve();
+    };
+    database.findGitHubConnection = () => Promise.resolve(acmeConnection());
+    const client = new GitHubClientFake();
+    client.verifyUserInstallation = () => Promise.resolve(acmeIdentity("active"));
+    const catalogue = new RegistrationConfigurationFake({});
+    catalogue.repositories = [
+      { repositoryId: 9001, fullName: "acme/app", defaultBranch: "main" },
+      { repositoryId: 9002, fullName: "acme/docs", defaultBranch: "develop" },
+    ];
+    const registration = createGitHubRegistration({
+      database,
+      auth: new RegistrationAuth(),
+      applicationBaseUrl: "https://hub.test",
+      publicBaseUrl: "https://hub.test",
+      configuration: githubConfiguration(),
+      appAuth: githubAuth(),
+      connectionClient: client,
+      configurationProvider: catalogue,
+      reactionClient: {
+        createReaction: () => Promise.resolve({ id: 1 }),
+        deleteReaction: () => Promise.resolve(),
+      },
+    });
+
+    const response = await registration.connection.actions["callback"]!(
+      new Request("https://hub.test/api/integrations/github/callback?state=s&code=c"),
+    );
+
+    assert.equal(response.status, 303);
+    assert.match(response.headers.get("location") ?? "", /result=github_connected/u);
+    assert.deepEqual(bound, [42]);
+    assert.deepEqual(catalogue.listed, [42]);
+    assert.deepEqual(await repositoryCatalogue(database), [
+      {
+        connectionId: "connection-1",
+        repositoryId: 9001,
+        fullName: "acme/app",
+        defaultBranch: "main",
+      },
+      {
+        connectionId: "connection-1",
+        repositoryId: 9002,
+        fullName: "acme/docs",
+        defaultBranch: "develop",
+      },
+    ]);
+  });
+
+  it("replaces the connection's repositories from installation lifecycle events", async () => {
+    const database = createMemoryDatabase();
+    await database.replaceGitHubRepositories("org", "connection-1", [
+      { repositoryId: 9001, fullName: "acme/app", defaultBranch: "main" },
+      { repositoryId: 9002, fullName: "acme/retired", defaultBranch: "main" },
+    ]);
+    let receipts = 0;
+    database.claimGitHubLifecycleReceipt = () => {
+      receipts += 1;
+      return Promise.resolve({
+        status: "claimed",
+        providerEventReceiptId: `lifecycle-trigger-${receipts}`,
+        installationId: 42,
+      });
+    };
+    database.applyGitHubLifecycle = () => Promise.resolve();
+    database.findGitHubConnection = () => Promise.resolve(acmeConnection());
+    const client = new GitHubClientFake();
+    let status: "active" | "suspended" = "active";
+    client.getInstallation = () =>
+      Promise.resolve({ status: "present" as const, identity: acmeIdentity(status) });
+    const catalogue = new RegistrationConfigurationFake({});
+    catalogue.repositories = [
+      { repositoryId: 9001, fullName: "acme/app", defaultBranch: "main" },
+      { repositoryId: 9003, fullName: "acme/new", defaultBranch: "main" },
+    ];
+    const registration = createGitHubRegistration({
+      database,
+      auth: new RegistrationAuth(),
+      applicationBaseUrl: "https://hub.test",
+      publicBaseUrl: "https://hub.test",
+      configuration: githubConfiguration(),
+      appAuth: githubAuth(),
+      connectionClient: client,
+      configurationProvider: catalogue,
+      reactionClient: {
+        createReaction: () => Promise.resolve({ id: 1 }),
+        deleteReaction: () => Promise.resolve(),
+      },
+    });
+
+    const added = await registration.requests[0]!.handle(
+      lifecycleWebhookRequest("installation_repositories", "lifecycle-1"),
+    );
+    assert.equal(added.status, 200);
+    assert.deepEqual(catalogue.listed, [42]);
+    assert.deepEqual(await repositoryCatalogue(database), [
+      {
+        connectionId: "connection-1",
+        repositoryId: 9001,
+        fullName: "acme/app",
+        defaultBranch: "main",
+      },
+      {
+        connectionId: "connection-1",
+        repositoryId: 9003,
+        fullName: "acme/new",
+        defaultBranch: "main",
+      },
+    ]);
+
+    status = "suspended";
+    catalogue.repositories = [];
+    const suspended = await registration.requests[0]!.handle(
+      lifecycleWebhookRequest("installation", "lifecycle-2"),
+    );
+    assert.equal(suspended.status, 200);
+    assert.deepEqual(catalogue.listed, [42]);
+    assert.equal((await repositoryCatalogue(database)).length, 2);
+  });
 });
+
+function acmeConnection() {
+  return {
+    id: "connection-1",
+    organizationId: "org",
+    slug: "acme",
+    installationId: 42,
+    accountId: "account-42",
+    accountLogin: "acme",
+    accountType: "Organization",
+    status: "active" as const,
+    providerApplicationId: "42",
+  };
+}
+
+function acmeIdentity(status: "active" | "suspended") {
+  return {
+    installationId: 42,
+    accountId: "account-42",
+    accountLogin: "acme",
+    accountType: "Organization",
+    status,
+  };
+}
+
+function authorizationAttempt(): ConnectionAttemptRecord {
+  return {
+    id: "attempt-1",
+    provider: "github",
+    phase: "github_user_authorization",
+    organizationId: "org",
+    returnRoute: "/connections",
+    userId: "user",
+    sessionId: "session",
+    candidateExternalId: "42",
+    pkceVerifier: "verifier",
+    configurationVersion: 0,
+    providerApplicationId: "42",
+    callbackOrigin: "https://hub.test",
+    configurationSnapshot: null,
+    expectedConfigurationVersion: null,
+    activateConfiguration: false,
+    expiresAt: new Date(Date.now() + 600_000),
+    consumedAt: null,
+  };
+}
+
+async function repositoryCatalogue(database: ReturnType<typeof createMemoryDatabase>) {
+  return (await database.listGitHubRepositories("org"))
+    .map(({ connectionId, repositoryId, fullName, defaultBranch }) => ({
+      connectionId,
+      repositoryId,
+      fullName,
+      defaultBranch,
+    }))
+    .sort((left, right) => left.repositoryId - right.repositoryId);
+}
+
+function lifecycleWebhookRequest(
+  event: "installation" | "installation_repositories",
+  deliveryId: string,
+): Request {
+  const body = JSON.stringify({ action: "added", installation: { id: 42 } });
+  const signature = "sha256=" + createHmac("sha256", "webhook-secret").update(body).digest("hex");
+  return new Request("https://hub.test/webhook", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-github-delivery": deliveryId,
+      "x-github-event": event,
+      "x-hub-signature-256": signature,
+    },
+    body,
+  });
+}
 
 class RegistrationConfigurationFake implements GitHubConfigurationProvider {
   readonly reads: Array<{ repositoryId: number; commitSha: string; path: string }> = [];
+  readonly listed: number[] = [];
+  repositories: Array<{ repositoryId: number; fullName: string; defaultBranch: string }> = [];
   private head = "";
   constructor(private readonly files: Readonly<Record<string, string>>) {}
-  listInstallationRepositories() {
-    return Promise.resolve([]);
+  listInstallationRepositories({ installationId }: { installationId: number }) {
+    this.listed.push(installationId);
+    return Promise.resolve(this.repositories);
   }
   readDefaultBranchHead() {
     return Promise.resolve(this.head);
@@ -642,7 +850,7 @@ class GitHubClientFake implements GitHubConnectionClient {
   authorizationUrl({ state }: { state: string; challenge: string }): string {
     return `https://github.test/authorize?state=${state}`;
   }
-  verifyUserInstallation() {
+  verifyUserInstallation(): ReturnType<GitHubConnectionClient["verifyUserInstallation"]> {
     return Promise.resolve(undefined);
   }
   getInstallation(): ReturnType<GitHubConnectionClient["getInstallation"]> {
