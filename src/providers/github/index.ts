@@ -99,6 +99,8 @@ export function createGitHubRegistration(
       appAuth,
       ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
     });
+  const githubConfiguration =
+    options.configurationProvider ?? createGitHubConfigurationProvider(appAuth);
   const connection =
     options.auth === null
       ? githubConnectionStatus(true)
@@ -112,6 +114,7 @@ export function createGitHubRegistration(
             configuration,
           },
           client,
+          githubConfiguration,
         );
   const webhook = createWebhookSource(configuration.webhookSecret, {
     accept: (input) =>
@@ -120,7 +123,7 @@ export function createGitHubRegistration(
         providerApplicationId: configuration.appId,
         providerConfigurationVersion: options.configurationVersion ?? 0,
       }),
-    applyLifecycle: (delivery) => applyLifecycle(database, client, delivery),
+    applyLifecycle: (delivery) => applyLifecycle(database, client, githubConfiguration, delivery),
     async synchronizePush(input) {
       const payload = PushPayloadSchema.safeParse(input.payload);
       if (!payload.success) return;
@@ -153,8 +156,6 @@ export function createGitHubRegistration(
       );
     },
   });
-  const githubConfiguration =
-    options.configurationProvider ?? createGitHubConfigurationProvider(appAuth);
   const reactions = options.reactionClient ?? createGitHubReactionClient(appAuth);
   logger.info("using webhook event source");
   return {
@@ -283,6 +284,7 @@ function emptyGitHubRegistration(
             },
           },
           undefined,
+          undefined,
         );
   return {
     connection,
@@ -318,9 +320,12 @@ function githubConnectionStatus(configured: boolean): ProviderConnectionRegistra
   };
 }
 
+type GitHubRepositoryCatalogue = Pick<GitHubConfigurationProvider, "listInstallationRepositories">;
+
 function createGitHubConnection(
   options: GitHubConnectionOptions,
   client: GitHubConnectionClient | undefined,
+  repositories: GitHubRepositoryCatalogue | undefined,
 ): ProviderConnectionRegistration {
   const start = async (request: Request): Promise<Response> => {
     const rejected = options.auth.rejectCookieMutation(request);
@@ -372,7 +377,7 @@ function createGitHubConnection(
       start,
       disconnect,
       setup: (request) => completeSetup(options, client, request),
-      callback: (request) => completeAuthorization(options, client, request),
+      callback: (request) => completeAuthorization(options, client, repositories, request),
     },
   };
 }
@@ -461,6 +466,7 @@ async function completeSetup(
 async function completeAuthorization(
   options: GitHubConnectionOptions,
   client: GitHubConnectionClient | undefined,
+  repositories: GitHubRepositoryCatalogue | undefined,
   request: Request,
 ): Promise<Response> {
   const url = new URL(request.url);
@@ -477,7 +483,7 @@ async function completeAuthorization(
       applicationBaseUrl: options.applicationBaseUrl,
     });
   }
-  if (state === null || code === null || client === undefined) {
+  if (state === null || code === null || client === undefined || repositories === undefined) {
     return connectionCallbackFailure({
       request,
       error: new GitHubCallbackError("invalid authorization callback"),
@@ -522,6 +528,7 @@ async function completeAuthorization(
       });
     }
     await bindGitHub(options.database, state, access, identity, options.configuration.appId);
+    await synchronizeInstallationRepositories(options.database, repositories, identity);
     return connectionResult(callbackOrigin, attempt.returnRoute, "github_connected", "github");
   } catch (error) {
     return connectionCallbackFailure({
@@ -568,6 +575,7 @@ interface GitHubLifecycleDelivery {
 async function applyLifecycle(
   database: Database,
   client: GitHubConnectionClient,
+  repositories: GitHubRepositoryCatalogue,
   delivery: GitHubLifecycleDelivery,
 ): Promise<void> {
   const claim = await database.claimGitHubLifecycleReceipt(delivery);
@@ -585,10 +593,31 @@ async function applyLifecycle(
       status: "present",
       identity: evidence.identity,
     });
+    await synchronizeInstallationRepositories(database, repositories, evidence.identity);
   } catch (error) {
     await database.releaseGitHubLifecycleReceipt(claim.providerEventReceiptId);
     throw error;
   }
+}
+
+/**
+ * Records the repositories an installation grants, so triggers can name them by `owner/repo`.
+ * Runs when a connection is bound and on every installation lifecycle event, since GitHub
+ * reports repository grants only through `installation_repositories` deliveries. A suspended
+ * installation cannot be listed and keeps its last known catalogue.
+ */
+async function synchronizeInstallationRepositories(
+  database: Database,
+  repositories: GitHubRepositoryCatalogue,
+  identity: GitHubInstallationIdentity,
+): Promise<void> {
+  if (identity.status !== "active") return;
+  const connection = await database.findGitHubConnection(identity.installationId);
+  if (connection === undefined) return;
+  const granted = await repositories.listInstallationRepositories({
+    installationId: identity.installationId,
+  });
+  await database.replaceGitHubRepositories(connection.organizationId, connection.id, granted);
 }
 
 function githubStatus(configured: boolean, bindings: readonly GitHubConnectionRecord[]) {

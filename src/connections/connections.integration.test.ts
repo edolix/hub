@@ -984,6 +984,12 @@ function createConnections(options: CreateConnectionsOptions): ProviderFixture {
           privateKey: "test-private-key",
         },
         connectionClient: options.github,
+        configurationProvider: {
+          listInstallationRepositories: () => Promise.resolve([]),
+          readDefaultBranchHead: () => Promise.reject(new Error("unused")),
+          listFilesAtCommit: () => Promise.reject(new Error("unused")),
+          readFileAtCommit: () => Promise.reject(new Error("unused")),
+        },
       }),
     );
   }

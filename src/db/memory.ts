@@ -2966,13 +2966,19 @@ class MemoryDatabase implements Database {
     return rows[0];
   }
 
-  async upsertGitHubRepositories(
+  async replaceGitHubRepositories(
     organizationId: string,
     connectionId: string,
-    repositories: Array<
+    repositories: ReadonlyArray<
       Pick<GitHubRepositoryRecord, "repositoryId" | "fullName" | "defaultBranch">
     >,
   ) {
+    const granted = new Set(repositories.map((repository) => repository.repositoryId));
+    for (const [key, existing] of this.githubRepositories) {
+      if (existing.connectionId === connectionId && !granted.has(existing.repositoryId)) {
+        this.githubRepositories.delete(key);
+      }
+    }
     for (const repository of repositories) {
       const id =
         this.githubRepositories.get(`${connectionId}:${repository.repositoryId}`)?.id ??
